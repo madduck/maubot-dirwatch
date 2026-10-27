@@ -31,6 +31,26 @@ directories:
     - "!ops:example.com"
 ```
 
+### Where the config lives
+
+Maubot does not read the config from a file you place on disk. Instead:
+
+- Upload the plugin. Maubot reads `base-config.yaml` from the plugin archive
+  and uses it as the default template.
+- Create an instance in the Maubot web UI. Maubot copies the template into
+  the new instance's config.
+- Edit the config in the instance editor in the web UI. Maubot stores the
+  result in its own database, not in a file.
+
+`base-config.yaml` in this repository is only the template. Edit the instance
+config in the web UI, not the template, so your changes apply to that instance
+and survive plugin updates. Do not look for a per-instance YAML file: Maubot
+keeps instance config in its database (`instance.config`), so there is nothing
+to edit on disk.
+
+The `mbc` CLI can list and edit instances, but the web UI editor is the normal
+way to change this config.
+
 ## Build
 
 Build the plugin into a `.mbp` file with `mbc build`, or zip the directory:
