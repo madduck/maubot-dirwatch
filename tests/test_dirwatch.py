@@ -8,12 +8,18 @@ import logging
 from pathlib import Path
 
 import pytest
+from asyncinotify import Mask
 from mautrix.types import ContentURI, RoomID
 
 from dirwatch import (
+    DONE_DIRNAME,
+    FAILED_DIRNAME,
     IMAGE_MIMETYPES,
     MAX_BYTES,
+    SKIPPED_DIRNAME,
+    WATCH_MASK,
     DirWatchBot,
+    _timestamped,
     render_markdown,
     truncate_at_line,
 )
@@ -56,6 +62,38 @@ def make_bot(directory: Path, rooms: list[str]) -> tuple[DirWatchBot, FakeClient
     bot.task = None
     bot.loop = asyncio.get_event_loop()
     return bot, client
+
+
+def filed(directory: Path, outcome: str, name: str) -> Path:
+    """Return the single file in `directory/outcome`, failing if absent."""
+    entries = sorted((directory / outcome).iterdir())
+    assert len(entries) == 1, f"expected one file in {outcome}, got {entries}"
+    assert entries[0].name.endswith(f"-{name}")
+    return entries[0]
+
+
+async def test_watch_mask_ignores_create_and_delete() -> None:
+    assert WATCH_MASK & Mask.CLOSE_WRITE
+    assert WATCH_MASK & Mask.MOVED_TO
+    assert not WATCH_MASK & Mask.CREATE
+    assert not WATCH_MASK & Mask.DELETE
+
+
+def test_timestamped_adds_utc_prefix(tmp_path: Path) -> None:
+    result = _timestamped(tmp_path / "note.txt")
+    assert result.name.endswith("-note.txt")
+    assert result.parent == tmp_path
+    stamp = result.name.removesuffix("-note.txt")
+    assert len(stamp) == len("2026-10-27-122401")
+    assert stamp[4] == stamp[7] == "-"
+
+
+def test_timestamped_avoids_collisions(tmp_path: Path) -> None:
+    first = _timestamped(tmp_path / "note.txt")
+    first.touch()
+    second = _timestamped(tmp_path / "note.txt")
+    assert second != first
+    assert second.name.endswith("-1-note.txt")
 
 
 def test_truncate_at_line_keeps_short_text() -> None:
@@ -101,63 +139,174 @@ async def test_process_posts_text(tmp_path: Path) -> None:
     bot, client = make_bot(tmp_path, ["!room:example.com"])
     target = tmp_path / "note.txt"
     target.write_text("hello")
-    await bot._process(target, tmp_path)
+    outcome = await bot._process(target, tmp_path)
+    assert outcome == DONE_DIRNAME
     assert client.texts == [{"room_id": "!room:example.com", "text": "hello"}]
-    assert not target.exists()
+    assert target.exists()
+    bot._dispose(target, tmp_path, outcome)
+    assert filed(tmp_path, DONE_DIRNAME, "note.txt").read_text() == "hello"
 
 
 async def test_process_posts_markdown_as_html(tmp_path: Path) -> None:
     bot, client = make_bot(tmp_path, ["!room:example.com"])
     target = tmp_path / "note.md"
     target.write_text("# Title")
-    await bot._process(target, tmp_path)
+    outcome = await bot._process(target, tmp_path)
+    assert outcome == DONE_DIRNAME
     assert len(client.texts) == 1
     assert client.texts[0]["text"] == "# Title"
     assert "<h1>Title</h1>" in str(client.texts[0]["html"])
-    assert not target.exists()
+    bot._dispose(target, tmp_path, outcome)
+    assert filed(tmp_path, DONE_DIRNAME, "note.md").exists()
 
 
 async def test_process_uploads_image(tmp_path: Path) -> None:
     bot, client = make_bot(tmp_path, ["!room:example.com"])
     target = tmp_path / "pic.png"
     target.write_bytes(b"\x89PNG")
-    await bot._process(target, tmp_path)
+    outcome = await bot._process(target, tmp_path)
+    assert outcome == DONE_DIRNAME
     assert client.uploads == [
         {"data": b"\x89PNG", "mime_type": "image/png", "filename": "pic.png"}
     ]
     assert client.images[0]["room_id"] == "!room:example.com"
     assert client.images[0]["file_name"] == "pic.png"
-    assert not target.exists()
+    bot._dispose(target, tmp_path, outcome)
+    assert filed(tmp_path, DONE_DIRNAME, "pic.png").read_bytes() == b"\x89PNG"
 
 
-async def test_process_ignores_unknown_extension(tmp_path: Path) -> None:
+async def test_process_reports_unknown_extension_as_skipped(tmp_path: Path) -> None:
     bot, client = make_bot(tmp_path, ["!room:example.com"])
     target = tmp_path / "data.bin"
     target.write_bytes(b"\x00\x01")
-    await bot._process(target, tmp_path)
+    outcome = await bot._process(target, tmp_path)
+    assert outcome == SKIPPED_DIRNAME
     assert client.texts == []
     assert client.uploads == []
     assert target.exists()
+    bot._dispose(target, tmp_path, outcome)
+    assert filed(tmp_path, SKIPPED_DIRNAME, "data.bin").read_bytes() == b"\x00\x01"
+
+
+async def test_settle_retries_then_moves_to_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("dirwatch.STABILITY_SECONDS", 0)
+    monkeypatch.setattr("dirwatch.RETRY_DELAYS", (0, 0, 0))
+    bot, client = make_bot(tmp_path, ["!room:example.com"])
+    calls = 0
+
+    async def boom(*args: object, **kwargs: object) -> None:  # noqa: ARG001
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("matrix said no")
+
+    client.send_text = boom  # type: ignore[method-assign]
+    target = tmp_path / "note.txt"
+    target.write_text("hello")
+    await bot._settle(target, tmp_path)
+    assert calls == 4
+    assert not target.exists()
+    assert filed(tmp_path, FAILED_DIRNAME, "note.txt").read_text() == "hello"
+    assert bot.timers == {}
+
+
+async def test_settle_succeeds_on_a_later_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("dirwatch.STABILITY_SECONDS", 0)
+    monkeypatch.setattr("dirwatch.RETRY_DELAYS", (0, 0, 0))
+    bot, client = make_bot(tmp_path, ["!room:example.com"])
+    calls = 0
+    real_send = client.send_text
+
+    async def flaky(room_id: str, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("temporary glitch")
+        await real_send(room_id, **kwargs)
+
+    client.send_text = flaky  # type: ignore[method-assign]
+    target = tmp_path / "note.txt"
+    target.write_text("hello")
+    await bot._settle(target, tmp_path)
+    assert calls == 3
+    assert client.texts == [{"room_id": "!room:example.com", "text": "hello"}]
+    assert filed(tmp_path, DONE_DIRNAME, "note.txt").exists()
+
+
+async def test_unsupported_extension_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("dirwatch.STABILITY_SECONDS", 0)
+    monkeypatch.setattr("dirwatch.RETRY_DELAYS", (0, 0, 0))
+    bot, _client = make_bot(tmp_path, ["!room:example.com"])
+    target = tmp_path / "data.bin"
+    target.write_bytes(b"\x00\x01")
+    await bot._settle(target, tmp_path)
+    assert filed(tmp_path, SKIPPED_DIRNAME, "data.bin").exists()
+
+
+async def test_retry_gives_up_if_the_file_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("dirwatch.STABILITY_SECONDS", 0)
+    monkeypatch.setattr("dirwatch.RETRY_DELAYS", (0, 0, 0))
+    bot, client = make_bot(tmp_path, ["!room:example.com"])
+
+    async def vanish(*args: object, **kwargs: object) -> None:  # noqa: ARG001
+        target.unlink()
+        raise RuntimeError("matrix said no")
+
+    client.send_text = vanish  # type: ignore[method-assign]
+    target = tmp_path / "note.txt"
+    target.write_text("hello")
+    await bot._settle(target, tmp_path)
+    assert not target.exists()
+    assert not (tmp_path / FAILED_DIRNAME).exists()
+    assert not (tmp_path / DONE_DIRNAME).exists()
+
+
+async def test_settle_does_not_move_file_under_active_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("dirwatch.STABILITY_SECONDS", 0)
+    bot, client = make_bot(tmp_path, ["!room:example.com"])
+    target = tmp_path / "growing.txt"
+    target.write_text("part one\n")
+    sizes = iter([(9, 1), (18, 2)])
+    monkeypatch.setattr("dirwatch._snapshot", lambda _path: next(sizes, (18, 2)))
+    await bot._settle(target, tmp_path)
+    assert client.texts == []
+    assert target.exists()
+    assert target in bot.timers
+    bot.timers[target].cancel()
+    bot.timers.pop(target, None)
 
 
 async def test_process_posts_to_every_room(tmp_path: Path) -> None:
     bot, client = make_bot(tmp_path, ["!a:example.com", "!b:example.com"])
     target = tmp_path / "note.txt"
     target.write_text("hi")
-    await bot._process(target, tmp_path)
+    outcome = await bot._process(target, tmp_path)
+    assert outcome == DONE_DIRNAME
     assert [entry["room_id"] for entry in client.texts] == [
         "!a:example.com",
         "!b:example.com",
     ]
 
 
-async def test_process_skips_empty_file_and_deletes(tmp_path: Path) -> None:
+async def test_process_moves_empty_file_to_skipped(tmp_path: Path) -> None:
     bot, client = make_bot(tmp_path, ["!room:example.com"])
     target = tmp_path / "empty.txt"
     target.write_text("   ")
-    await bot._process(target, tmp_path)
+    outcome = await bot._process(target, tmp_path)
+    assert outcome == SKIPPED_DIRNAME
     assert client.texts == []
-    assert not target.exists()
+    assert target.exists()
+    bot._dispose(target, tmp_path, outcome)
+    assert filed(tmp_path, SKIPPED_DIRNAME, "empty.txt").exists()
 
 
 async def test_settle_processes_existing_file(
@@ -170,6 +319,7 @@ async def test_settle_processes_existing_file(
     await bot._settle(target, tmp_path)
     assert client.texts == [{"room_id": "!room:example.com", "text": "hello"}]
     assert target not in bot.timers
+    assert filed(tmp_path, DONE_DIRNAME, "note.txt").read_text() == "hello"
 
 
 async def test_settle_skips_deleted_file(
@@ -215,3 +365,4 @@ async def test_watch_loop_end_to_end(
             await task
     assert client.texts == [{"room_id": "!room:example.com", "text": "hello"}]
     assert not (tmp_path / "note.txt").exists()
+    assert filed(tmp_path, DONE_DIRNAME, "note.txt").read_text() == "hello"

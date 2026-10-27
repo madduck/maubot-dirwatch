@@ -3,7 +3,7 @@ name = "dirwatch"
 description = "A maubot plugin that posts settled files from local directories."
 readme = "README.md"
 license = "MIT"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.12"
 dependencies = [
   "asyncinotify>=4.0",
