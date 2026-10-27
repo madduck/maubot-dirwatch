@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check tag matches maubot.yaml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          plugin_version="$(grep -E '^version:' maubot.yaml | sed -E 's/^version:[[:space:]]*//')"
+          if [ "$tag_version" != "$plugin_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match maubot.yaml version ${plugin_version}" >&2
+            exit 1
+          fi
+          echo "Tag and maubot.yaml version agree: ${plugin_version}"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build plugin
+        run: |
+          uv tool install maubot
+          mkdir -p dist
+          mbc build --output dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.mbp
