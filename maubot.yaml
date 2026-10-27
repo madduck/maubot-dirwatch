@@ -1,0 +1,10 @@
+maubot: 0.1.0
+id: net.madduck.dirwatch
+version: 0.1.0
+license: MIT
+modules:
+- dirwatch
+main_class: DirWatchBot
+config: true
+extra_files:
+- base-config.yaml

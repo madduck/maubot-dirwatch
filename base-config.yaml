@@ -1,0 +1,8 @@
+# Directories to watch, mapped to the rooms that receive their files.
+#
+# Each key is an absolute path to a local directory. Each value is a list of
+# Matrix room IDs. When a file in the directory has not changed for three
+# seconds, the plugin posts the file to every listed room and then deletes it.
+directories:
+  /var/spool/dirwatch/example:
+    - "!roomid:example.com"

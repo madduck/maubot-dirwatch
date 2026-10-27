@@ -1,0 +1,66 @@
+[project]
+name = "dirwatch"
+description = "A maubot plugin that posts settled files from local directories."
+readme = "README.md"
+license = "MIT"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "asyncinotify>=4.0",
+  "maubot>=0.4",
+  "markdown2>=2.5",
+]
+
+[dependency-groups]
+dev = [
+  "asyncinotify>=4.0",
+  "maubot>=0.4",
+  "markdown2>=2.5",
+  "mypy>=1.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.17",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "A", "ARG", "B", "C4", "D", "DTZ", "E", "ERA", "F", "I", "N",
+  "PIE", "PL", "PT", "PTH", "Q", "RET", "RSE", "SIM", "T10", "UP", "W",
+]
+ignore = [
+  "D203",
+  "D212",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D101", "D102", "D103", "D104", "D107", "PLR2004"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["dirwatch", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["markdown2", "asyncinotify", "pytest"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["maubot", "maubot.*"]
+ignore_missing_imports = true
+disable_error_code = ["attr-defined", "misc"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "conftest"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
